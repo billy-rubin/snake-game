@@ -2,7 +2,7 @@ syntax = "proto2";
 package snakes;
 option java_package = "me.ippolitov.fit.snakes";
 option java_outer_classname = "SnakesProto";
-
+option go_package = "./internal/domain;domain";
 // Роль узла в топологии связей узлов в пределах игры
 enum NodeRole {
     NORMAL = 0; // Обычный узел, лист в топологии "звезда"
