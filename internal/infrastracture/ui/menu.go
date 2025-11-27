@@ -43,6 +43,7 @@ type Menu struct {
 	games        []*domain.GameAnnouncement
 	gamesTable   *tview.Table
 	selectedGame int // индекс в m.games, -1 если ничего
+	appRunning   bool
 }
 
 const (
@@ -71,11 +72,6 @@ func NewMenu(cb Callbacks) *Menu {
 	m.app.SetRoot(m.pages, true).SetFocus(m.mainForm)
 
 	return m
-}
-
-// Run запускает UI и блокирует до выхода.
-func (m *Menu) Run() error {
-	return m.app.Run()
 }
 
 // buildMainPage строит главный экран и запоминает форму в m.mainForm.
@@ -468,14 +464,24 @@ func (m *Menu) refreshGamesTable() {
 	}
 }
 
-// SetGames обновляет список игр в меню "Подключиться к игре".
-// Можно вызывать из любого горути на фоне; обновление будет перенесено в UI-поток.
+// Run запускает главный цикл tview.Application.
+// ВАЖНО: не пересоздаём m.app и m.pages, они уже настроены в NewMenu.
+func (m *Menu) Run() error {
+	m.appRunning = true
+	defer func() { m.appRunning = false }()
+
+	return m.app.Run()
+}
+
+// SetGames вызывается Lobby-ем из фонового потока.
+// Мы обновляем список игр и, если UI запущен, перерисовываем таблицу через QueueUpdateDraw.
 func (m *Menu) SetGames(games []*domain.GameAnnouncement) {
 	m.games = games
-	if m.gamesTable == nil {
+	if m.gamesTable == nil || !m.appRunning {
+		// Меню ещё не запущено или уже остановлено — просто обновляем данные в памяти.
 		return
 	}
-	// Безопасное обновление из другого goroutine.
+
 	m.app.QueueUpdateDraw(func() {
 		m.refreshGamesTable()
 	})

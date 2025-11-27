@@ -2,10 +2,10 @@ package application
 
 import (
 	"fmt"
+	"google.golang.org/protobuf/proto"
 	"math/rand"
-	"time"
-
 	"snake-game/internal/domain"
+	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -21,6 +21,8 @@ type localSinglePlayerGame struct {
 	cfg      *domain.GameConfig
 	state    *domain.GameState
 	playerID int32
+
+	stateOut chan<- *domain.GameState
 
 	width, height int32
 
@@ -43,11 +45,11 @@ type localSinglePlayerGame struct {
 // внешняя точка входа для main.go
 func RunLocalSinglePlayer(
 	cfg *domain.GameConfig,
-	playerName string,
-	gameName string,
+	playerName, gameName string,
 	pType domain.PlayerType,
+	stateOut chan<- *domain.GameState,
 ) error {
-	g := newLocalSinglePlayerGame(cfg, playerName, gameName, pType)
+	g := newLocalSinglePlayerGame(cfg, playerName, gameName, pType, stateOut)
 	return g.run()
 }
 
@@ -58,6 +60,7 @@ func newLocalSinglePlayerGame(
 	playerName string,
 	gameName string,
 	pType domain.PlayerType,
+	stateOut chan<- *domain.GameState,
 ) *localSinglePlayerGame {
 	width := cfg.GetWidth()
 	height := cfg.GetHeight()
@@ -103,6 +106,7 @@ func newLocalSinglePlayerGame(
 		width:      width,
 		height:     height,
 		gameName:   gameName,
+		stateOut:   stateOut,
 		playerName: playerName,
 		rng:        rand.New(rand.NewSource(time.Now().UnixNano())),
 		quit:       make(chan struct{}),
@@ -422,7 +426,16 @@ func (g *localSinglePlayerGame) step() {
 	g.syncSnakeProto()
 	g.syncFoodProto()
 
-	// перерисовываем
+	// Отдаём снапшот состояния серверу.
+	if g.stateOut != nil && g.state != nil {
+		snapshot := proto.Clone(g.state).(*domain.GameState)
+		select {
+		case g.stateOut <- snapshot:
+		default:
+			// канал заполнен — просто пропускаем этот кадр
+		}
+	}
+
 	g.redraw()
 }
 

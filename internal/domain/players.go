@@ -1,4 +1,3 @@
-// internal/domain/players.go
 package domain
 
 // NewPlayer создаёт объект GamePlayer с заданными полями.

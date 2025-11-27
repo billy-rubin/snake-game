@@ -65,3 +65,5 @@ func boolp(v bool) *bool    { return &v }
 func stringp(v string) *string {
 	return &v
 }
+func playerTyePtr(t PlayerType) *PlayerType { return &t }
+func nodeRolePtr(r NodeRole) *NodeRole      { return &r }

@@ -1,7 +1,9 @@
 // internal/domain/spawn.go
 package domain
 
-import "fmt"
+import (
+	"fmt"
+)
 
 var ErrNoSpaceForNewSnake = fmt.Errorf("domain: no space to place new snake")
 

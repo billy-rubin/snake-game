@@ -1,7 +1,8 @@
-// internal/domain/engine.go
 package domain
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // TickResult — агрегированная информация о результате хода.
 // Состояние игры уже изменено внутри GameState.

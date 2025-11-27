@@ -1,4 +1,3 @@
-// internal/domain/board.go
 package domain
 
 // Cell — внутренняя "ячейка" для работы с координатами на поле.

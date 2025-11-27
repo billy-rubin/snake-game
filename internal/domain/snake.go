@@ -1,7 +1,9 @@
 // internal/domain/snake.go
 package domain
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // SnakeCells декодирует представление "ключевых точек" змеи в полный
 // список занятых клеток (от головы к хвосту).
