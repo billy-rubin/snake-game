@@ -10,8 +10,6 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
-	"google.golang.org/protobuf/proto"
-
 	"snake-game/internal/domain"
 	"snake-game/internal/infrastracture/network"
 )
@@ -24,7 +22,9 @@ type GameClient struct {
 	gameName   string
 	playerName string
 	playerType domain.PlayerType
+	reqRole    domain.NodeRole
 
+	myID    int32
 	nodeID  int32
 	nextSeq int64
 
@@ -38,6 +38,7 @@ func NewGameClient(
 	gameName string,
 	playerName string,
 	pType domain.PlayerType,
+	role domain.NodeRole,
 	logger *log.Logger,
 ) (*GameClient, error) {
 	if serverAddr == nil {
@@ -59,7 +60,8 @@ func NewGameClient(
 		gameName:   gameName,
 		playerName: playerName,
 		playerType: pType,
-		nodeID:     100, // произвольный client node_id
+		reqRole:    role,
+		nodeID:     0,
 		nextSeq:    1,
 	}, nil
 }
@@ -69,39 +71,29 @@ func (c *GameClient) incrementNextSeq() int64 {
 	return c.nextSeq
 }
 
-// JoinOnce выполняет один цикл Join + ожидание Ack (+ попытка получить Announcement).
-// ВАЖНО: соединение НЕ закрывается здесь — оно нужно для дальнейшего приёма StateMsg.
 func (c *GameClient) JoinOnce() error {
 	seq := c.incrementNextSeq()
 
-	join := &domain.GameMessage{
-		MsgSeq:   proto.Int64(seq),
-		SenderId: proto.Int32(c.nodeID),
-		Type: &domain.GameMessage_Join{
-			Join: &domain.GameMessage_JoinMsg{
-				GameName:      proto.String(c.gameName),
-				PlayerName:    proto.String(c.playerName),
-				PlayerType:    c.playerType.Enum(),
-				RequestedRole: domain.NodeRole_VIEWER.Enum(), // сейчас всегда наблюдатель
-			},
-		},
-	}
+	joinMsg := domain.NewJoinMessage(
+		seq,
+		c.nodeID,
+		c.playerType,
+		c.playerName,
+		c.gameName,
+		c.reqRole,
+	)
 
-	if err := c.conn.Send(join, c.serverAddr); err != nil {
+	if err := c.conn.Send(joinMsg, c.serverAddr); err != nil {
 		return fmt.Errorf("send Join: %w", err)
 	}
 	c.log.Printf("JOIN sent seq=%d to %s", seq, c.serverAddr)
 
 	gotAck := false
-
 	deadline := time.Now().Add(3 * time.Second)
+
 	for time.Now().Before(deadline) {
 		env, err := c.conn.ReceiveOneWithTimeout(500 * time.Millisecond)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			c.log.Printf("receive after Join error: %v", err)
 			continue
 		}
 		if env == nil || env.Msg == nil {
@@ -109,31 +101,27 @@ func (c *GameClient) JoinOnce() error {
 		}
 
 		msg := env.Msg
-
 		switch t := msg.Type.(type) {
 		case *domain.GameMessage_Ack:
-			_ = t
+			if msg.ReceiverId != nil {
+				c.myID = msg.GetReceiverId()
+				c.nodeID = c.myID
+			}
 			gotAck = true
-			c.log.Printf("ACK received from %s for seq=%d", env.From, msg.GetMsgSeq())
+			c.log.Printf("ACK received. My PlayerID = %d", c.myID)
+
+		case *domain.GameMessage_Error:
+			return fmt.Errorf("server rejected join: %s", t.Error.GetErrorMessage())
 
 		case *domain.GameMessage_Announcement:
 			ann := t.Announcement
-			if ann == nil {
-				continue
-			}
-			for _, g := range ann.GetGames() {
-				if g.GetGameName() == c.gameName {
-					c.cfg = g.GetConfig()
-					c.log.Printf("ANN for game %q: %dx%d players=%d",
-						c.gameName,
-						c.cfg.GetWidth(), c.cfg.GetHeight(),
-						len(g.GetPlayers().GetPlayers()),
-					)
+			if ann != nil {
+				for _, g := range ann.GetGames() {
+					if g.GetGameName() == c.gameName {
+						c.cfg = g.GetConfig()
+					}
 				}
 			}
-
-		default:
-			// другие типы игнорируем
 		}
 
 		if gotAck {
@@ -144,43 +132,71 @@ func (c *GameClient) JoinOnce() error {
 	if !gotAck {
 		return fmt.Errorf("no Ack for Join")
 	}
-
 	if c.cfg == nil {
-		// На всякий случай, чтобы рендер не упал.
 		c.cfg = &domain.GameConfig{}
 	}
-
 	return nil
 }
 
-// RunViewer — tview-приложение, которое в реальном времени показывает приходящие StateMsg.
-func (c *GameClient) RunViewer() error {
+func (c *GameClient) RunGame() error {
 	app := tview.NewApplication()
 
-	text := tview.NewTextView().
+	textView := tview.NewTextView().
 		SetDynamicColors(true).
+		SetScrollable(false).
 		SetChangedFunc(func() {
 			app.Draw()
 		})
-	text.SetBorder(true).
-		SetTitle(fmt.Sprintf("Game: %s  (viewer: %s)", c.gameName, c.playerName))
 
-	// Управление: q / ESC / Ctrl+C — выход.
-	text.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+	textView.SetBorder(true).
+		SetTitle(fmt.Sprintf(" Game: %s ", c.gameName))
+
+	textView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if c.reqRole == domain.NodeRole_VIEWER || c.playerType == domain.PlayerType_ROBOT {
+			if event.Key() == tcell.KeyEsc || event.Rune() == 'q' {
+				app.Stop()
+				return nil
+			}
+			return event
+		}
+
+		var dir domain.Direction
 		switch event.Key() {
-		case tcell.KeyESC, tcell.KeyCtrlC:
+		case tcell.KeyUp:
+			dir = domain.Direction_UP
+		case tcell.KeyDown:
+			dir = domain.Direction_DOWN
+		case tcell.KeyLeft:
+			dir = domain.Direction_LEFT
+		case tcell.KeyRight:
+			dir = domain.Direction_RIGHT
+		case tcell.KeyEsc:
 			app.Stop()
 			return nil
 		}
+
 		switch event.Rune() {
+		case 'w', 'W':
+			dir = domain.Direction_UP
+		case 's', 'S':
+			dir = domain.Direction_DOWN
+		case 'a', 'A':
+			dir = domain.Direction_LEFT
+		case 'd', 'D':
+			dir = domain.Direction_RIGHT
 		case 'q', 'Q':
 			app.Stop()
+			return nil
+		}
+
+		if dir != 0 {
+			go c.sendSteer(dir)
 			return nil
 		}
 		return event
 	})
 
-	app.SetRoot(text, true)
+	app.SetRoot(textView, true)
 
 	stopCh := make(chan struct{})
 	var wg sync.WaitGroup
@@ -188,11 +204,10 @@ func (c *GameClient) RunViewer() error {
 
 	go func() {
 		defer wg.Done()
-		c.recvStateLoop(stopCh, app, text)
+		c.recvLoop(stopCh, app, textView)
 	}()
 
 	err := app.Run()
-
 	close(stopCh)
 	wg.Wait()
 	_ = c.conn.Close()
@@ -200,8 +215,14 @@ func (c *GameClient) RunViewer() error {
 	return err
 }
 
-// recvStateLoop слушает StateMsg и обновляет текстовое представление поля.
-func (c *GameClient) recvStateLoop(stopCh <-chan struct{}, app *tview.Application, text *tview.TextView) {
+func (c *GameClient) sendSteer(d domain.Direction) {
+	msg := domain.NewSteerMessage(c.incrementNextSeq(), c.myID, d)
+	if err := c.conn.Send(msg, c.serverAddr); err != nil {
+		c.log.Printf("failed to send steer: %v", err)
+	}
+}
+
+func (c *GameClient) recvLoop(stopCh <-chan struct{}, app *tview.Application, tv *tview.TextView) {
 	for {
 		select {
 		case <-stopCh:
@@ -211,10 +232,6 @@ func (c *GameClient) recvStateLoop(stopCh <-chan struct{}, app *tview.Applicatio
 
 		env, err := c.conn.ReceiveOneWithTimeout(500 * time.Millisecond)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			c.log.Printf("viewer receive error: %v", err)
 			continue
 		}
 		if env == nil || env.Msg == nil {
@@ -225,7 +242,6 @@ func (c *GameClient) recvStateLoop(stopCh <-chan struct{}, app *tview.Applicatio
 		if stMsg == nil {
 			continue
 		}
-
 		st := stMsg.GetState()
 
 		if st.GetStateOrder() <= c.lastStateOrder {
@@ -235,76 +251,123 @@ func (c *GameClient) recvStateLoop(stopCh <-chan struct{}, app *tview.Applicatio
 		c.state = st
 
 		app.QueueUpdateDraw(func() {
-			text.SetText(renderRemoteState(c.cfg, c.state))
+			tv.SetText(c.renderState(st))
 		})
 	}
 }
 
-// Очень упрощённый рендер: рисуем поле, еду и только головы змей.
-func renderRemoteState(cfg *domain.GameConfig, st *domain.GameState) string {
+// renderState — ВОЗВРАЩАЕМ СТАРУЮ ГРАФИКУ
+func (c *GameClient) renderState(st *domain.GameState) string {
 	if st == nil {
-		return "Waiting for game state...\n\nPress 'q' or ESC to exit viewer."
+		return "Waiting for state..."
 	}
-
-	w := int(cfg.GetWidth())
-	h := int(cfg.GetHeight())
+	w := int(c.cfg.GetWidth())
+	h := int(c.cfg.GetHeight())
 	if w <= 0 {
 		w = 40
 	}
 	if h <= 0 {
-		h = 25
+		h = 30
 	}
 
-	board := make([][]rune, h)
+	field := make([][]rune, h)
 	for y := 0; y < h; y++ {
-		row := make([]rune, w)
+		field[y] = make([]rune, w)
 		for x := 0; x < w; x++ {
-			row[x] = ' '
+			field[y][x] = ' '
 		}
-		board[y] = row
 	}
 
-	// Еда
 	for _, f := range st.GetFoods() {
-		x := int(f.GetX())
-		y := int(f.GetY())
+		x, y := int(f.GetX()), int(f.GetY())
 		if x >= 0 && x < w && y >= 0 && y < h {
-			board[y][x] = '*'
+			field[y][x] = '*'
 		}
 	}
 
-	// Головы змей
 	for _, s := range st.GetSnakes() {
-		points := s.GetPoints()
-		if len(points) == 0 {
-			continue
-		}
-		head := points[0]
-		x := int(head.GetX())
-		y := int(head.GetY())
-		if x >= 0 && x < w && y >= 0 && y < h {
-			board[y][x] = 'S'
+		cells := domain.SnakeCells(s, domain.BoardSize{Width: int32(w), Height: int32(h)})
+		isMe := (s.GetPlayerId() == c.myID)
+		isZombie := (s.GetState() == domain.GameState_Snake_ZOMBIE)
+
+		for i, cell := range cells {
+			cx, cy := int(cell.X), int(cell.Y)
+			if cx < 0 || cx >= w || cy < 0 || cy >= h {
+				continue
+			}
+
+			var char rune
+			if isMe {
+				if i == 0 {
+					char = 'O'
+				} else {
+					char = 'o'
+				}
+			} else if isZombie {
+				char = 'Z'
+			} else {
+				if i == 0 {
+					char = 'S'
+				} else {
+					char = 's'
+				}
+			}
+			field[cy][cx] = char
 		}
 	}
 
 	var b strings.Builder
 
+	// Подсчет своих очков
+	myScore := 0
+	for _, p := range st.GetPlayers().GetPlayers() {
+		if p.GetId() == c.myID {
+			myScore = int(p.GetScore())
+		}
+	}
+
+	// Верхняя панель
+	b.WriteString(fmt.Sprintf(
+		"Игра: [white]%s[-]  |  Игрок: [yellow]%s[-]  |  Счёт: [green]%d[-]  |  Размер: %dx%d\n\n",
+		c.gameName, c.playerName, myScore, w, h,
+	))
+
+	// Поле
+	b.WriteString("+" + strings.Repeat("-", w) + "+\n")
 	for y := 0; y < h; y++ {
 		b.WriteString("|")
 		for x := 0; x < w; x++ {
-			b.WriteRune(board[y][x])
+			r := field[y][x]
+			switch r {
+			case 'O', 'o':
+				b.WriteString("[green]")
+				b.WriteRune(r)
+				b.WriteString("[-]")
+			case 'S', 's':
+				b.WriteString("[red]")
+				b.WriteRune(r)
+				b.WriteString("[-]")
+			case '*':
+				b.WriteString("[yellow]*[-]")
+			case 'Z':
+				b.WriteString("[gray]Z[-]")
+			default:
+				b.WriteRune(r)
+			}
 		}
 		b.WriteString("|\n")
 	}
+	b.WriteString("+" + strings.Repeat("-", w) + "+\n")
 
-	b.WriteString("\nPlayers:\n")
-	if st.GetPlayers() != nil {
-		for _, p := range st.GetPlayers().GetPlayers() {
-			fmt.Fprintf(&b, "- %s (score=%d, role=%s)\n",
-				p.GetName(), p.GetScore(), p.GetRole().String())
+	// Список игроков
+	b.WriteString("\nИгроки:\n")
+	for _, p := range st.GetPlayers().GetPlayers() {
+		marker := ""
+		if p.GetId() == c.myID {
+			marker = " (YOU)"
 		}
+		b.WriteString(fmt.Sprintf(" - %s%s: %d\n", p.GetName(), marker, p.GetScore()))
 	}
 
-	b.WriteString("\nPress 'q' or ESC to exit viewer.")
 	return b.String()
 }

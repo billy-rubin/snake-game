@@ -7,13 +7,14 @@ import (
 	"path/filepath"
 	"time"
 
+	"google.golang.org/protobuf/proto" // НЕ ЗАБУДЬТЕ ДОБАВИТЬ ЭТОТ ИМПОРТ
+
 	"snake-game/internal/application"
 	"snake-game/internal/domain"
 	"snake-game/internal/infrastracture/ui"
 )
 
-// ====== логгер в файлы logs/ ======
-
+// ... (функция newFileLogger остается без изменений) ...
 func newFileLogger(fileName string, prefix string) (*log.Logger, *os.File, error) {
 	if err := os.MkdirAll("logs", 0o755); err != nil {
 		return nil, nil, err
@@ -27,10 +28,6 @@ func newFileLogger(fileName string, prefix string) (*log.Logger, *os.File, error
 	return logger, f, nil
 }
 
-func int32Ptr(v int32) *int32 { return &v }
-
-// ====== MAIN ======
-
 type startLocalGameRequest struct {
 	cfg        *domain.GameConfig
 	playerName string
@@ -39,6 +36,7 @@ type startLocalGameRequest struct {
 }
 
 func main() {
+	// ... (логика создания логгеров остается без изменений) ...
 	serverLogger, serverFile, err := newFileLogger("server.log", "[SERVER] ")
 	if err != nil {
 		log.Fatalf("cannot create server logger: %v", err)
@@ -51,6 +49,7 @@ func main() {
 	}
 	defer clientFile.Close()
 
+	// ... (переменные для меню остаются без изменений) ...
 	var (
 		startReq      *startLocalGameRequest
 		exitRequested bool
@@ -64,12 +63,7 @@ func main() {
 	)
 
 	callbacks := ui.Callbacks{
-		CreateGame: func(
-			cfg *domain.GameConfig,
-			playerName string,
-			gameName string,
-			pType domain.PlayerType,
-		) error {
+		CreateGame: func(cfg *domain.GameConfig, playerName string, gameName string, pType domain.PlayerType) error {
 			startReq = &startLocalGameRequest{
 				cfg:        cfg,
 				playerName: playerName,
@@ -78,12 +72,7 @@ func main() {
 			}
 			return nil
 		},
-		JoinGame: func(
-			ann *domain.GameAnnouncement,
-			playerName string,
-			requestedRole domain.NodeRole,
-			pType domain.PlayerType,
-		) error {
+		JoinGame: func(ann *domain.GameAnnouncement, playerName string, requestedRole domain.NodeRole, pType domain.PlayerType) error {
 			joinReq.ann = ann
 			joinReq.playerName = playerName
 			joinReq.requested = requestedRole
@@ -98,7 +87,6 @@ func main() {
 
 	menu := ui.NewMenu(callbacks)
 
-	// Стартуем Lobby, чтобы список игр в меню "Подключиться" обновлялся автоматически.
 	lobby, err := application.NewLobby(clientLogger, func(games []*domain.GameAnnouncement) {
 		menu.SetGames(games)
 	})
@@ -117,66 +105,103 @@ func main() {
 
 	switch {
 	case startReq != nil:
-		runAsMaster(startReq, serverLogger)
+		runAsMaster(startReq, serverLogger) // <--- Тут изменения внутри
 
 	case haveJoinReq:
 		runAsClient(&joinReq, clientLogger)
 
 	default:
-		// ничего не выбрано
 	}
 }
 
-// MASTER: поднимаем GameServer + локальный одиночный движок.
-// ВАЖНО: RunLocalSinglePlayer должен принимать stateOut chan<- *domain.GameState
-// и на каждом шаге отсылать туда текущее состояние.
+// MASTER: Запускает Engine + Server + Local UI (MasterController)
 func runAsMaster(req *startLocalGameRequest, serverLogger *log.Logger) {
-	cfg := req.cfg
-	gameName := req.gameName
+	// 1. Каналы
+	// engineOut - сюда пишет Engine
+	engineOut := make(chan *domain.GameState, 32)
 
-	// Канал для стриминга состояния от движка к GameServer.
-	stateCh := make(chan *domain.GameState, 16)
+	// serverIn - отсюда читает GameServer для рассылки по сети
+	serverIn := make(chan *domain.GameState, 32)
 
+	// uiIn - отсюда читает MasterController для отрисовки хосту
+	uiIn := make(chan *domain.GameState, 32)
+
+	// 2. Разветвитель (Broadcaster):
+	// Читает из engineOut и пересылает копии в serverIn и uiIn
+	go func() {
+		defer close(serverIn)
+		defer close(uiIn)
+
+		for st := range engineOut {
+			// Клонируем стейт для каждого потребителя, чтобы избежать гонок данных,
+			// если один потребитель (Server) читает медленнее другого (UI).
+			// Proto.Clone возвращает интерфейс, кастим обратно.
+
+			stForServer := proto.Clone(st).(*domain.GameState)
+			stForUI := proto.Clone(st).(*domain.GameState)
+
+			// Non-blocking send (если буфер полон — дропаем кадр, это нормально для реалтайм игры)
+			select {
+			case serverIn <- stForServer:
+			default:
+			}
+
+			select {
+			case uiIn <- stForUI:
+			default:
+			}
+		}
+	}()
+
+	// 3. Создаем Engine
+	engine := application.NewGameEngine(req.cfg, engineOut, serverLogger)
+
+	// 4. Создаем GameServer (передаем serverIn)
 	srv, err := application.NewGameServer(
-		cfg,
-		gameName,
+		req.cfg,
+		req.gameName,
 		req.playerName,
 		req.playerType,
 		serverLogger,
-		stateCh,
+		serverIn, // <--- Сервер читает отсюда
+		engine,
 	)
 	if err != nil {
 		serverLogger.Fatalf("cannot create GameServer: %v", err)
 	}
 
-	serverUDP := srv.Addr()
-	serverLogger.Printf("GameServer is starting on %s", serverUDP)
+	// 5. Создаем UI для Мастера (MasterController)
+	// Мастер всегда имеет ID = 1 (зашито в GameServer.NewGameServer)
+	masterCtrl := application.NewMasterController(
+		req.gameName,
+		1, // Master ID
+		req.cfg,
+		engine,
+		uiIn, // <--- UI читает отсюда
+	)
 
-	// Запускаем сервер в отдельной горутине.
+	// 6. ЗАПУСК
+	// Запускаем Engine в фоне
+	go engine.Run()
+
+	// Запускаем Server в фоне
 	go func() {
 		if err := srv.Run(); err != nil {
-			serverLogger.Printf("GameServer stopped with error: %v", err)
+			serverLogger.Printf("GameServer stopped: %v", err)
 		}
 	}()
 
-	// Локальная однопользовательская игра, которая публикует GameState в stateCh.
-	if err := application.RunLocalSinglePlayer(
-		cfg,
-		req.playerName,
-		gameName,
-		req.playerType,
-		stateCh, // новый параметр: канал для GameState
-	); err != nil {
-		serverLogger.Printf("local single-player game error: %v", err)
+	// Запускаем UI в ГЛАВНОМ потоке (tview требует main thread)
+	if err := masterCtrl.Run(); err != nil {
+		serverLogger.Printf("Master UI stopped: %v", err)
 	}
 
-	// Закрываем канал, чтобы stateBroadcastLoop завершился.
-	close(stateCh)
-
-	time.Sleep(500 * time.Millisecond)
+	// Когда UI закрылся (ESC/Q) — останавливаем всё
+	engine.Stop()
+	time.Sleep(200 * time.Millisecond) // Даем время на cleanup
 }
 
-// CLIENT: подключаемся к выбранному анонсу и запускаем viewer.
+// CLIENT (без изменений, просто для полноты картины)
 func runAsClient(
 	req *struct {
 		ann        *domain.GameAnnouncement
@@ -188,16 +213,9 @@ func runAsClient(
 ) {
 	ann := req.ann
 	if ann == nil {
-		clientLogger.Printf("no announcement selected")
 		return
 	}
-
 	players := ann.GetPlayers().GetPlayers()
-	if len(players) == 0 {
-		clientLogger.Printf("announcement has no players (no MASTER?)")
-		return
-	}
-
 	var master *domain.GamePlayer
 	for _, p := range players {
 		if p.GetRole() == domain.NodeRole_MASTER {
@@ -209,11 +227,10 @@ func runAsClient(
 		clientLogger.Printf("no MASTER player in announcement")
 		return
 	}
-
-	ip := net.ParseIP(master.GetIpAddress())
-	if ip == nil {
-		clientLogger.Printf("MASTER has invalid IP %q", master.GetIpAddress())
-		return
+	ipStr := master.GetIpAddress()
+	ip := net.ParseIP(ipStr)
+	if ip == nil || ip.IsUnspecified() {
+		ip = net.ParseIP("127.0.0.1")
 	}
 	serverAddr := &net.UDPAddr{
 		IP:   ip,
@@ -225,6 +242,7 @@ func runAsClient(
 		ann.GetGameName(),
 		req.playerName,
 		req.playerType,
+		req.requested,
 		clientLogger,
 	)
 	if err != nil {
@@ -236,10 +254,9 @@ func runAsClient(
 		clientLogger.Printf("JoinOnce error: %v", err)
 		return
 	}
-	clientLogger.Printf("JoinOnce succeeded, starting viewer...")
 
-	if err := client.RunViewer(); err != nil {
-		clientLogger.Printf("viewer finished with error: %v", err)
+	if err := client.RunGame(); err != nil {
+		clientLogger.Printf("client game finished with error: %v", err)
 	}
 
 	time.Sleep(500 * time.Millisecond)

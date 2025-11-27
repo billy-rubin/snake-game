@@ -42,6 +42,13 @@ type localSinglePlayerGame struct {
 	quit chan struct{}
 }
 
+type PlayerInput struct {
+	PlayerID  int32
+	Direction domain.Direction
+}
+
+var globalInputChan chan PlayerInput
+
 // внешняя точка входа для main.go
 func RunLocalSinglePlayer(
 	cfg *domain.GameConfig,
@@ -98,6 +105,7 @@ func newLocalSinglePlayerGame(
 		StateOrder: &stateOrder,
 		Players:    players,
 	}
+	globalInputChan = make(chan PlayerInput, 64)
 
 	g := &localSinglePlayerGame{
 		cfg:        cfg,
