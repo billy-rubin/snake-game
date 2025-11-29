@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -12,21 +13,17 @@ import (
 	"snake-game/internal/infrastracture/network"
 )
 
-// Константы мультикаста.
 const (
 	multicastIP   = "239.192.0.4"
 	multicastPort = 9192
 )
 
-// GameServer обслуживает протокол MASTER-узла.
 type GameServer struct {
 	cfg      *domain.GameConfig
 	gameName string
 
-	// Ссылка на игровой движок (Application Logic)
 	engine *GameEngine
-
-	// Текущее состояние (кешируем для Announcement/Ack)
+	// Последний стейт для Announcement и новых подключений
 	lastState *domain.GameState
 
 	nodeID       int32
@@ -36,21 +33,25 @@ type GameServer struct {
 	conn *network.UnicastConn
 	log  *log.Logger
 
+	// Защита мап игроков и времени
+	mu sync.RWMutex
 	// key: player_id -> адрес клиента
 	players map[int32]*net.UDPAddr
+	// key: player_id -> время последнего входящего пакета (для таймаута)
+	playersLastSeen map[int32]time.Time
+	// key: player_id -> время последнего исходящего пакета (для пинга)
+	playersLastSent map[int32]time.Time
 
-	// Канал, через который движок присылает обновления
 	stateUpdates <-chan *domain.GameState
+	stopCh       chan struct{}
 }
 
-// NewGameServer создает сервер и поднимает движок.
 func NewGameServer(
 	cfg *domain.GameConfig,
 	gameName string,
 	masterName string,
 	masterType domain.PlayerType,
 	logger *log.Logger,
-	// channel создается снаружи в main и передается сюда и в Engine
 	stateUpdates <-chan *domain.GameState,
 	engine *GameEngine,
 ) (*GameServer, error) {
@@ -69,36 +70,36 @@ func NewGameServer(
 	udpAddr := conn.LocalAddr()
 	logger.Printf("GameServer is starting on %s", udpAddr.String())
 
-	// Определяем IP для конфига
 	ip := udpAddr.IP
 	if ip == nil || ip.IsUnspecified() {
 		ip = net.ParseIP("127.0.0.1")
 	}
 
-	// Создаем Мастера
 	masterID := int32(1)
 	masterPlayer := domain.NewPlayer(masterID, masterName, domain.NodeRole_MASTER, masterType)
 	masterPlayer.IpAddress = proto.String(ip.String())
 	masterPlayer.Port = proto.Int32(int32(udpAddr.Port))
 
-	// Инициализируем мастера в движке
 	if err := engine.AddPlayer(masterPlayer); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("failed to add master player: %w", err)
 	}
 
 	s := &GameServer{
-		cfg:          cfg,
-		gameName:     gameName,
-		engine:       engine,
-		nodeID:       masterID,
-		nextPlayerID: masterID + 1,
-		nextMsgSeq:   1,
-		conn:         conn,
-		log:          logger,
-		players:      make(map[int32]*net.UDPAddr),
-		stateUpdates: stateUpdates,
-		lastState:    &domain.GameState{}, // заглушка пока не придет первый стейт
+		cfg:             cfg,
+		gameName:        gameName,
+		engine:          engine,
+		nodeID:          masterID,
+		nextPlayerID:    masterID + 1,
+		nextMsgSeq:      1,
+		conn:            conn,
+		log:             logger,
+		players:         make(map[int32]*net.UDPAddr),
+		playersLastSeen: make(map[int32]time.Time),
+		playersLastSent: make(map[int32]time.Time),
+		stateUpdates:    stateUpdates,
+		lastState:       &domain.GameState{},
+		stopCh:          make(chan struct{}),
 	}
 
 	return s, nil
@@ -113,31 +114,146 @@ func (s *GameServer) nextSeq() int64 {
 	return s.nextMsgSeq
 }
 
+// sendWrapper оборачивает отправку для обновления времени LastSent
+func (s *GameServer) sendWrapper(msg *domain.GameMessage, to *net.UDPAddr) error {
+	err := s.conn.Send(msg, to)
+	if err == nil {
+		// Если сообщение адресное (есть ReceiverId), обновляем таймер отправки
+		if msg.ReceiverId != nil {
+			recID := msg.GetReceiverId()
+			s.mu.Lock()
+			s.playersLastSent[recID] = time.Now()
+			s.mu.Unlock()
+		}
+	}
+	return err
+}
+
 func (s *GameServer) Run() error {
 	defer s.conn.Close()
 
 	s.log.Printf("GameServer[%s] listening on %s", s.gameName, s.conn.LocalAddr())
 
-	// Запускаем рассылку стейтов
 	go s.stateBroadcastLoop()
-
-	// Запускаем мультикаст анонсов
 	go s.announceLoop()
+	go s.pingerAndTimeoutLoop() // <-- Запуск проверки таймаутов
 
-	// Читаем входящие сообщения
 	for {
 		env, err := s.conn.ReceiveOneWithTimeout(500 * time.Millisecond)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			select {
+			case <-s.stopCh:
+				return nil
+			default:
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					continue
+				}
+				s.log.Printf("receive error: %v", err)
 				continue
 			}
-			s.log.Printf("receive error: %v", err)
-			continue
 		}
 		if env == nil || env.Msg == nil {
 			continue
 		}
+
+		// Обновляем LastSeen при получении ЛЮБОГО сообщения
+		senderID := env.Msg.GetSenderId()
+		if senderID != 0 {
+			s.mu.Lock()
+			// Если мы знаем такого игрока, обновляем таймер
+			if _, ok := s.players[senderID]; ok {
+				s.playersLastSeen[senderID] = time.Now()
+			}
+			s.mu.Unlock()
+		}
+
 		s.handleMessage(env.Msg, env.From)
+	}
+}
+
+func (s *GameServer) Stop() {
+	close(s.stopCh)
+}
+
+// pingerAndTimeoutLoop отвечает за Alive Checks
+func (s *GameServer) pingerAndTimeoutLoop() {
+	delayMs := s.cfg.GetStateDelayMs()
+	if delayMs < 100 {
+		delayMs = 100
+	}
+
+	// Интервал пинга = delay / 10
+	pingInterval := time.Duration(delayMs/10) * time.Millisecond
+	// Таймаут = 0.8 * delay
+	timeoutDuration := time.Duration(float64(delayMs)*0.8) * time.Millisecond
+
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			s.checkAlive(pingInterval, timeoutDuration)
+		}
+	}
+}
+
+func (s *GameServer) checkAlive(pingInterval, timeoutDuration time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	// Кого удалять (нельзя удалять из map во время итерации)
+	toRemove := []int32{}
+
+	for id, addr := range s.players {
+		if id == s.nodeID {
+			continue // Самого себя не проверяем
+		}
+
+		// 1. Проверка таймаута (0.8 * state_delay)
+		lastSeen, seenOk := s.playersLastSeen[id]
+		if !seenOk {
+			// Если игрока только добавили, считаем что видели только что
+			s.playersLastSeen[id] = now
+			lastSeen = now
+		}
+
+		if now.Sub(lastSeen) > timeoutDuration {
+			s.log.Printf("Player %d timed out (last seen %v ago)", id, now.Sub(lastSeen))
+			toRemove = append(toRemove, id)
+			continue
+		}
+
+		// 2. Отправка Ping (если молчали > state_delay / 10)
+		lastSent, sentOk := s.playersLastSent[id]
+		if !sentOk {
+			s.playersLastSent[id] = now
+			lastSent = now
+		}
+
+		if now.Sub(lastSent) > pingInterval {
+			// Шлем Ping
+			pingMsg := domain.NewPingMessage(s.nextSeq(), s.nodeID, id)
+			// Используем прямой conn.Send чтобы не вызвать deadlock (sendWrapper берет лок)
+			// Но обновляем время вручную здесь, так как мы УЖЕ под локом
+			if err := s.conn.Send(pingMsg, addr); err == nil {
+				s.playersLastSent[id] = now
+			}
+		}
+	}
+
+	// Удаляем отвалившихся
+	for _, id := range toRemove {
+		delete(s.players, id)
+		delete(s.playersLastSeen, id)
+		delete(s.playersLastSent, id)
+
+		// Сообщаем движку, что игрок умер (Змейка -> Zombie)
+		// Делаем это в горутине, чтобы не блочить лок
+		go s.engine.RemovePlayer(id)
 	}
 }
 
@@ -148,27 +264,28 @@ func (s *GameServer) stateBroadcastLoop() {
 		}
 		s.lastState = st
 
-		// Если нет внешних игроков — не шлем (экономия трафика), но локально стейт обновлен
+		s.mu.RLock()
 		if len(s.players) == 0 {
+			s.mu.RUnlock()
 			continue
 		}
 
-		msg := &domain.GameMessage{
-			MsgSeq:   proto.Int64(s.nextSeq()),
-			SenderId: proto.Int32(s.nodeID),
-			Type: &domain.GameMessage_State{
-				State: &domain.GameMessage_StateMsg{
-					State: st,
-				},
-			},
-		}
-
+		// Копируем список адресатов под RLock
+		targets := make(map[int32]*net.UDPAddr, len(s.players))
 		for id, addr := range s.players {
+			targets[id] = addr
+		}
+		s.mu.RUnlock()
+
+		msg := domain.NewStateMessage(s.nextSeq(), s.nodeID, st)
+
+		for id, addr := range targets {
 			if addr == nil {
 				continue
 			}
 			msg.ReceiverId = proto.Int32(id)
-			if err := s.conn.Send(msg, addr); err != nil {
+			// sendWrapper обновит LastSent
+			if err := s.sendWrapper(msg, addr); err != nil {
 				s.log.Printf("cannot send StateMsg to %s: %v", addr, err)
 			}
 		}
@@ -183,38 +300,33 @@ func (s *GameServer) announceLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		msg := s.buildAnnouncementMsg()
-		msg.ReceiverId = nil
-		if err := s.conn.Send(msg, group); err != nil {
-			s.log.Printf("cannot send multicast Announcement: %v", err)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ticker.C:
+			msg := s.buildAnnouncementMsg()
+			msg.ReceiverId = nil
+			// Мультикаст не обновляет LastSent конкретных игроков
+			s.conn.Send(msg, group)
 		}
 	}
 }
 
 func (s *GameServer) buildAnnouncementMsg() *domain.GameMessage {
-	// Берем игроков из последнего стейта
 	currentPlayers := s.lastState.GetPlayers()
 	if currentPlayers == nil {
 		currentPlayers = &domain.GamePlayers{}
 	}
 
-	return &domain.GameMessage{
-		MsgSeq:   proto.Int64(s.nextSeq()),
-		SenderId: proto.Int32(s.nodeID),
-		Type: &domain.GameMessage_Announcement{
-			Announcement: &domain.GameMessage_AnnouncementMsg{
-				Games: []*domain.GameAnnouncement{
-					{
-						Config:   s.cfg,
-						CanJoin:  proto.Bool(true),
-						GameName: proto.String(s.gameName),
-						Players:  currentPlayers,
-					},
-				},
-			},
+	return domain.NewAnnouncementMessage(s.nextSeq(), s.nodeID, []*domain.GameAnnouncement{
+		{
+			Config:   s.cfg,
+			CanJoin:  proto.Bool(true),
+			GameName: proto.String(s.gameName),
+			Players:  currentPlayers,
 		},
-	}
+	})
 }
 
 func (s *GameServer) handleMessage(msg *domain.GameMessage, from *net.UDPAddr) {
@@ -226,9 +338,9 @@ func (s *GameServer) handleMessage(msg *domain.GameMessage, from *net.UDPAddr) {
 	case *domain.GameMessage_Steer:
 		s.handleSteer(msg, t.Steer)
 	case *domain.GameMessage_Ping:
-		// TODO: обновлять время последнего контакта для таймаута
+		// Пинг обновляет LastSeen (это уже сделано в Run),
+		// отвечать на него не нужно, он просто update alive status
 	default:
-		// Ack и другие игнорируем пока
 	}
 }
 
@@ -252,21 +364,21 @@ func (s *GameServer) handleJoin(
 	player.IpAddress = proto.String(from.IP.String())
 	player.Port = proto.Int32(int32(from.Port))
 
-	// Добавляем в движок (там же происходит Spawn змеи)
 	if err := s.engine.AddPlayer(player); err != nil {
 		s.log.Printf("Failed to join player %s: %v", name, err)
-		// Отправляем ErrorMsg
 		errMsg := domain.NewErrorMessage(s.nextSeq(), s.nodeID, newID, err.Error())
 		s.conn.Send(errMsg, from)
 		return
 	}
 
-	// Регистрируем адрес для рассылки
+	s.mu.Lock()
 	s.players[newID] = from
+	s.playersLastSeen[newID] = time.Now()
+	s.playersLastSent[newID] = time.Now()
+	s.mu.Unlock()
 
-	// Шлем Ack с присвоенным ReceiverId
 	ack := domain.NewAckMessage(raw.GetMsgSeq(), s.nodeID, newID)
-	if err := s.conn.Send(ack, from); err != nil {
+	if err := s.sendWrapper(ack, from); err != nil {
 		s.log.Printf("cannot send Ack to %s: %v", from, err)
 	}
 
@@ -276,8 +388,6 @@ func (s *GameServer) handleJoin(
 func (s *GameServer) handleSteer(raw *domain.GameMessage, steer *domain.GameMessage_SteerMsg) {
 	senderID := raw.GetSenderId()
 	dir := steer.GetDirection()
-
-	// Передаем управление в движок
 	s.engine.ApplySteer(senderID, dir)
 }
 

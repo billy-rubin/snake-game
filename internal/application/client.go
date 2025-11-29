@@ -31,6 +31,13 @@ type GameClient struct {
 	cfg            *domain.GameConfig
 	state          *domain.GameState
 	lastStateOrder int32
+
+	// Alive checks
+	mu             sync.Mutex
+	serverLastSeen time.Time // Когда последний раз получали пакет от сервера
+	lastSent       time.Time // Когда последний раз что-то слали
+
+	stopCh chan struct{}
 }
 
 func NewGameClient(
@@ -63,12 +70,24 @@ func NewGameClient(
 		reqRole:    role,
 		nodeID:     0,
 		nextSeq:    1,
+		stopCh:     make(chan struct{}),
 	}, nil
 }
 
 func (c *GameClient) incrementNextSeq() int64 {
 	c.nextSeq++
 	return c.nextSeq
+}
+
+// sendWrapper оборачивает отправку для обновления lastSent
+func (c *GameClient) sendWrapper(msg *domain.GameMessage) error {
+	err := c.conn.Send(msg, c.serverAddr)
+	if err == nil {
+		c.mu.Lock()
+		c.lastSent = time.Now()
+		c.mu.Unlock()
+	}
+	return err
 }
 
 func (c *GameClient) JoinOnce() error {
@@ -83,7 +102,7 @@ func (c *GameClient) JoinOnce() error {
 		c.reqRole,
 	)
 
-	if err := c.conn.Send(joinMsg, c.serverAddr); err != nil {
+	if err := c.sendWrapper(joinMsg); err != nil {
 		return fmt.Errorf("send Join: %w", err)
 	}
 	c.log.Printf("JOIN sent seq=%d to %s", seq, c.serverAddr)
@@ -99,6 +118,11 @@ func (c *GameClient) JoinOnce() error {
 		if env == nil || env.Msg == nil {
 			continue
 		}
+
+		// Обновляем время получения
+		c.mu.Lock()
+		c.serverLastSeen = time.Now()
+		c.mu.Unlock()
 
 		msg := env.Msg
 		switch t := msg.Type.(type) {
@@ -135,6 +159,14 @@ func (c *GameClient) JoinOnce() error {
 	if c.cfg == nil {
 		c.cfg = &domain.GameConfig{}
 	}
+
+	// Инициализируем таймеры после успешного Join
+	c.mu.Lock()
+	now := time.Now()
+	c.serverLastSeen = now
+	c.lastSent = now
+	c.mu.Unlock()
+
 	return nil
 }
 
@@ -198,17 +230,23 @@ func (c *GameClient) RunGame() error {
 
 	app.SetRoot(textView, true)
 
-	stopCh := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(2)
 
+	// Читатель
 	go func() {
 		defer wg.Done()
-		c.recvLoop(stopCh, app, textView)
+		c.recvLoop(app, textView)
+	}()
+
+	// Пингер / Чекера таймаута
+	go func() {
+		defer wg.Done()
+		c.pingerLoop(app)
 	}()
 
 	err := app.Run()
-	close(stopCh)
+	close(c.stopCh)
 	wg.Wait()
 	_ = c.conn.Close()
 
@@ -217,15 +255,59 @@ func (c *GameClient) RunGame() error {
 
 func (c *GameClient) sendSteer(d domain.Direction) {
 	msg := domain.NewSteerMessage(c.incrementNextSeq(), c.myID, d)
-	if err := c.conn.Send(msg, c.serverAddr); err != nil {
+	if err := c.sendWrapper(msg); err != nil {
 		c.log.Printf("failed to send steer: %v", err)
 	}
 }
 
-func (c *GameClient) recvLoop(stopCh <-chan struct{}, app *tview.Application, tv *tview.TextView) {
+// pingerLoop следит за связью с сервером
+func (c *GameClient) pingerLoop(app *tview.Application) {
+	delayMs := c.cfg.GetStateDelayMs()
+	if delayMs < 100 {
+		delayMs = 100
+	}
+
+	pingInterval := time.Duration(delayMs/10) * time.Millisecond
+	timeoutDuration := time.Duration(float64(delayMs)*0.8) * time.Millisecond
+
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-stopCh:
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.mu.Lock()
+			lastSeen := c.serverLastSeen
+			lastSent := c.lastSent
+			c.mu.Unlock()
+
+			now := time.Now()
+
+			// 1. Проверка: не умер ли сервер?
+			if now.Sub(lastSeen) > timeoutDuration {
+				c.log.Printf("Server timed out! (last seen %v ago)", now.Sub(lastSeen))
+				app.Stop() // Выход из UI
+				return
+			}
+
+			// 2. Отправка пинга, если мы молчим
+			if now.Sub(lastSent) > pingInterval {
+				pingMsg := domain.NewPingMessage(c.incrementNextSeq(), c.myID, 0)
+				// sendWrapper возьмет лок и обновит lastSent
+				if err := c.sendWrapper(pingMsg); err != nil {
+					c.log.Printf("failed to send Ping: %v", err)
+				}
+			}
+		}
+	}
+}
+
+func (c *GameClient) recvLoop(app *tview.Application, tv *tview.TextView) {
+	for {
+		select {
+		case <-c.stopCh:
 			return
 		default:
 		}
@@ -237,6 +319,11 @@ func (c *GameClient) recvLoop(stopCh <-chan struct{}, app *tview.Application, tv
 		if env == nil || env.Msg == nil {
 			continue
 		}
+
+		// Обновляем таймер, что сервер жив
+		c.mu.Lock()
+		c.serverLastSeen = time.Now()
+		c.mu.Unlock()
 
 		stMsg := env.Msg.GetState()
 		if stMsg == nil {
@@ -256,7 +343,6 @@ func (c *GameClient) recvLoop(stopCh <-chan struct{}, app *tview.Application, tv
 	}
 }
 
-// renderState — ВОЗВРАЩАЕМ СТАРУЮ ГРАФИКУ
 func (c *GameClient) renderState(st *domain.GameState) string {
 	if st == nil {
 		return "Waiting for state..."
@@ -318,7 +404,6 @@ func (c *GameClient) renderState(st *domain.GameState) string {
 
 	var b strings.Builder
 
-	// Подсчет своих очков
 	myScore := 0
 	for _, p := range st.GetPlayers().GetPlayers() {
 		if p.GetId() == c.myID {
@@ -326,13 +411,11 @@ func (c *GameClient) renderState(st *domain.GameState) string {
 		}
 	}
 
-	// Верхняя панель
 	b.WriteString(fmt.Sprintf(
 		"Игра: [white]%s[-]  |  Игрок: [yellow]%s[-]  |  Счёт: [green]%d[-]  |  Размер: %dx%d\n\n",
 		c.gameName, c.playerName, myScore, w, h,
 	))
 
-	// Поле
 	b.WriteString("+" + strings.Repeat("-", w) + "+\n")
 	for y := 0; y < h; y++ {
 		b.WriteString("|")
@@ -359,7 +442,6 @@ func (c *GameClient) renderState(st *domain.GameState) string {
 	}
 	b.WriteString("+" + strings.Repeat("-", w) + "+\n")
 
-	// Список игроков
 	b.WriteString("\nИгроки:\n")
 	for _, p := range st.GetPlayers().GetPlayers() {
 		marker := ""
