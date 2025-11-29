@@ -95,27 +95,33 @@ func (e *GameEngine) AddPlayer(p *domain.GamePlayer) error {
 	return nil
 }
 
-// RemovePlayer обрабатывает выход игрока (змея становится ZOMBIE).
+// RemovePlayer переводит игрока в статус зрителя и превращает змею в зомби.
 func (e *GameEngine) RemovePlayer(playerID int32) {
 	e.steersMu.Lock()
 	defer e.steersMu.Unlock()
 
-	// Удаляем из списка игроков
-	players := e.state.Players.Players
-	for i, p := range players {
+	// 1. Обновляем роль игрока в списке (не удаляем совсем, чтобы видеть счет)
+	for _, p := range e.state.Players.Players {
 		if p.GetId() == playerID {
-			// Удаляем из слайса
-			e.state.Players.Players = append(players[:i], players[i+1:]...)
+			viewer := domain.NodeRole_VIEWER
+			p.Role = &viewer
 			break
 		}
 	}
 
-	// Находим змею и делаем её зомби
-	snake := domain.SnakeByPlayerID(e.state, playerID)
-	if snake != nil {
-		zombie := domain.GameState_Snake_ZOMBIE
-		snake.State = &zombie
+	// 2. Находим змею и делаем её зомби
+	// (domain.SnakeByPlayerID ищет змею в списке)
+	for _, s := range e.state.Snakes {
+		if s.GetPlayerId() == playerID {
+			zombie := domain.GameState_Snake_ZOMBIE
+			s.State = &zombie
+			// Зомби продолжает движение в том же направлении,
+			// steer-команды для него больше не приходят (игрок отключен).
+			break
+		}
 	}
+
+	e.log.Printf("Player %d removed (became ZOMBIE/VIEWER)", playerID)
 }
 
 // ApplySteer сохраняет намерение повернуть. Вызывается из GameServer при получении SteerMsg.
