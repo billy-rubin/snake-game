@@ -477,9 +477,18 @@ func (s *GameServer) handleJoin(
 		return
 	}
 
-	// Здесь упрощение: если игрок ретраит Join, мы создадим дубликат.
-	// По-хорошему надо проверять, нет ли игрока с таким IP:Port.
-	// Но для выполнения пункта "Надежность" главное — отправить Ack.
+	s.mu.RLock()
+	for id, pAddr := range s.players {
+		// Сравниваем IP и Порт (или Имя, если считаем его уникальным)
+		if pAddr.String() == from.String() {
+			s.mu.RUnlock()
+			// Игрок уже есть, просто шлем Ack повторно
+			s.log.Printf("Duplicate Join from %s, resending Ack", from)
+			s.sendAck(raw.GetMsgSeq(), id, from) // Используем уже существующий ID
+			return
+		}
+	}
+	s.mu.RUnlock()
 
 	newID := s.nextPlayerID
 	s.nextPlayerID++
