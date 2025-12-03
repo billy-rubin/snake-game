@@ -10,28 +10,20 @@ import (
 	"snake-game/internal/domain"
 )
 
-// Multicast-адрес для Announcement/Discover,
-// строго по условию задачи.
 const (
 	MulticastAddress = "239.192.0.4:9192"
-	// Безопасный верхний предел для UDP-пакета.
-	MaxDatagramSize = 64 * 1024
+	MaxDatagramSize  = 64 * 1024
 )
 
-// Envelope – обёртка "сообщение + адрес отправителя".
 type Envelope struct {
 	Msg  *domain.GameMessage
 	From *net.UDPAddr
 }
 
-// ---------- Unicast сокет (вся игровая логика) ----------
-
 type UnicastConn struct {
 	conn *net.UDPConn
 }
 
-// NewUnicastConn создаёт обычный UDP-сокет.
-// Если laddr == nil, ОС сама выберет порт.
 func NewUnicastConn(laddr *net.UDPAddr) (*UnicastConn, error) {
 	if laddr == nil {
 		laddr = &net.UDPAddr{
@@ -52,7 +44,6 @@ func (u *UnicastConn) Close() error {
 	return u.conn.Close()
 }
 
-// LocalAddr возвращает реальный адрес сокета (с выбранным портом).
 func (u *UnicastConn) LocalAddr() *net.UDPAddr {
 	if u == nil || u.conn == nil {
 		return nil
@@ -63,7 +54,6 @@ func (u *UnicastConn) LocalAddr() *net.UDPAddr {
 	return nil
 }
 
-// Send сериализует GameMessage и отправляет его одному получателю.
 func (u *UnicastConn) Send(msg *domain.GameMessage, to *net.UDPAddr) error {
 	if msg == nil {
 		return fmt.Errorf("nil GameMessage")
@@ -84,7 +74,6 @@ func (u *UnicastConn) Send(msg *domain.GameMessage, to *net.UDPAddr) error {
 	return nil
 }
 
-// ReceiveOne блокирующе читает один UDP-датаграмм и декодирует GameMessage.
 func (u *UnicastConn) ReceiveOne() (*Envelope, error) {
 	buf := make([]byte, MaxDatagramSize)
 
@@ -104,8 +93,6 @@ func (u *UnicastConn) ReceiveOne() (*Envelope, error) {
 	}, nil
 }
 
-// ReceiveOneWithTimeout читает один UDP-пакет с тайм-аутом.
-// При истечении тайм-аута вернёт ошибку net.Error с Timeout() == true.
 func (u *UnicastConn) ReceiveOneWithTimeout(timeout time.Duration) (*Envelope, error) {
 	if err := u.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("set read deadline: %w", err)

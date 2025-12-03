@@ -43,7 +43,7 @@ func (m *MasterController) Run() error {
 	m.app = tview.NewApplication()
 
 	m.view = tview.NewTextView().
-		SetDynamicColors(true). // Включаем поддержку цветов [red], [green] и т.д.
+		SetDynamicColors(true).
 		SetScrollable(false).
 		SetChangedFunc(func() {
 			m.app.Draw()
@@ -112,7 +112,6 @@ func (m *MasterController) listenerLoop() {
 	}
 }
 
-// renderState — ВОЗВРАЩАЕМ СТАРУЮ ГРАФИКУ
 func (m *MasterController) renderState(st *domain.GameState) string {
 	if st == nil {
 		return "Waiting for game start..."
@@ -126,16 +125,14 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 		h = 30
 	}
 
-	// 1. Создаем "канвас" из пробелов
 	field := make([][]rune, h)
 	for y := 0; y < h; y++ {
 		field[y] = make([]rune, w)
 		for x := 0; x < w; x++ {
-			field[y][x] = ' ' // Пустое поле - пробел (как в оригинале)
+			field[y][x] = ' '
 		}
 	}
 
-	// 2. Рисуем еду как '*'
 	for _, f := range st.GetFoods() {
 		x, y := int(f.GetX()), int(f.GetY())
 		if x >= 0 && x < w && y >= 0 && y < h {
@@ -143,11 +140,9 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 		}
 	}
 
-	// 3. Рисуем змей
 	myScore := 0
 	myName := "Player"
 
-	// Сначала найдем свои очки для отображения в заголовке
 	for _, p := range st.GetPlayers().GetPlayers() {
 		if p.GetId() == m.myID {
 			myScore = int(p.GetScore())
@@ -157,8 +152,8 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 
 	for _, s := range st.GetSnakes() {
 		cells := domain.SnakeCells(s, domain.BoardSize{Width: int32(w), Height: int32(h)})
-		isMe := (s.GetPlayerId() == m.myID)
-		isZombie := (s.GetState() == domain.GameState_Snake_ZOMBIE)
+		isMe := s.GetPlayerId() == m.myID
+		isZombie := s.GetState() == domain.GameState_Snake_ZOMBIE
 
 		for i, cell := range cells {
 			cx, cy := int(cell.X), int(cell.Y)
@@ -166,22 +161,21 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 				continue
 			}
 
-			// Логика символов из local_single_player.go
 			var char rune
 			if isMe {
 				if i == 0 {
-					char = 'O' // Моя голова
+					char = 'O'
 				} else {
-					char = 'o' // Мое тело
+					char = 'o'
 				}
 			} else if isZombie {
-				char = 'Z' // Зомби
+				char = 'Z'
 			} else {
 				// Враги
 				if i == 0 {
-					char = 'S' // Голова врага
+					char = 'S'
 				} else {
-					char = 's' // Тело врага
+					char = 's'
 				}
 			}
 			field[cy][cx] = char
@@ -190,7 +184,6 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 
 	var b strings.Builder
 
-	// Заголовок в стиле local_single_player
 	b.WriteString(fmt.Sprintf(
 		"Игра: [white]%s[-]  |  Игрок: [yellow]%s[-]  |  Счёт: [green]%d[-]  |  Размер: %dx%d\n",
 		m.gameName, myName, myScore, w, h,
@@ -204,7 +197,6 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 	for y := 0; y < h; y++ {
 		b.WriteString("|")
 		for x := 0; x < w; x++ {
-			// Красим символы
 			r := field[y][x]
 			switch r {
 			case 'O', 'o':
@@ -226,7 +218,6 @@ func (m *MasterController) renderState(st *domain.GameState) string {
 		b.WriteString("|\n")
 	}
 
-	// Нижняя граница
 	b.WriteString("+" + strings.Repeat("-", w) + "+\n")
 
 	return b.String()

@@ -7,23 +7,16 @@ import (
 
 var ErrNoSpaceForNewSnake = fmt.Errorf("domain: no space to place new snake")
 
-// SpawnSnakeResult — результат размещения новой змейки.
 type SpawnSnakeResult struct {
 	Snake   *GameState_Snake
 	Head    Cell
 	Tail    Cell
-	Players *GamePlayers // тот же объект, для удобства чейнинга
+	Players *GamePlayers
 }
 
-// SpawnNewSnake пытается разместить змею нового игрока в соответствии
-// с правилом "квадрат 5x5 без змей, голова в центре, хвост — в одну из
-// четырёх соседних клеток без еды".
-//
-// Если подходящее место найти не удалось, возвращает ErrNoSpaceForNewSnake.
 func SpawnNewSnake(cfg *GameConfig, state *GameState, playerID int32, rng Random) (*SpawnSnakeResult, error) {
 	size := BoardSizeFromConfig(cfg)
 
-	// 1. Заполняем occupancy по змеям (все клетки, занятые любой змеёй).
 	occupiedBySnake := make(map[Cell]struct{})
 
 	for _, s := range state.GetSnakes() {
@@ -32,7 +25,6 @@ func SpawnNewSnake(cfg *GameConfig, state *GameState, playerID int32, rng Random
 		}
 	}
 
-	// 2. Еда на поле.
 	foodCells := make(map[Cell]struct{})
 	for _, f := range state.GetFoods() {
 		foodCells[CoordToCell(f)] = struct{}{}
@@ -45,7 +37,6 @@ func SpawnNewSnake(cfg *GameConfig, state *GameState, playerID int32, rng Random
 
 	var candidates []square
 
-	// 3. Находим все квадраты 5x5 без змеек.
 	for x0 := int32(0); x0 < size.Width; x0++ {
 		for y0 := int32(0); y0 < size.Height; y0++ {
 			ok := true
@@ -71,20 +62,16 @@ func SpawnNewSnake(cfg *GameConfig, state *GameState, playerID int32, rng Random
 		return nil, ErrNoSpaceForNewSnake
 	}
 
-	// 4. Перемешивать кандидатов можно, но достаточно случайно выбирать.
-	// Пробуем все кандидаты в псевдослучайном порядке.
 	startIdx := rng.Intn(len(candidates))
 
 	tryCount := len(candidates)
 	for i := 0; i < tryCount; i++ {
 		sq := candidates[(startIdx+i)%len(candidates)]
-		// Центр квадрата 5x5.
 		head := Cell{
 			X: Wrap(sq.X0+2, size.Width),
 			Y: Wrap(sq.Y0+2, size.Height),
 		}
 
-		// Эту клетку тоже нельзя, если там еда.
 		if _, hasFood := foodCells[head]; hasFood {
 			continue
 		}
@@ -117,15 +104,11 @@ func SpawnNewSnake(cfg *GameConfig, state *GameState, playerID int32, rng Random
 		}
 
 		if len(tails) == 0 {
-			// В этом квадрате нельзя подобрать хвост без еды.
 			continue
 		}
 
-		// Выбираем случайный хвост.
 		t := tails[rng.Intn(len(tails))]
 
-		// По условию: направление движения головы ПРОТИВОПОЛОЖНО
-		// выбранному направлению хвоста.
 		headDir := OppositeDirection(t.dir)
 
 		cells := []Cell{head, t.cell}
@@ -134,7 +117,6 @@ func SpawnNewSnake(cfg *GameConfig, state *GameState, playerID int32, rng Random
 			return nil, err
 		}
 
-		// Добавляем змейку в состояние.
 		state.Snakes = append(state.Snakes, snake)
 
 		return &SpawnSnakeResult{

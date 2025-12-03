@@ -174,7 +174,7 @@ func (s *GameServer) Run() error {
 
 	go s.stateBroadcastLoop()
 	go s.announceLoop()
-	go s.pingerAndRetransmitLoop() // <-- Объединенный цикл пингов и ретраев
+	go s.pingerAndRetransmitLoop()
 
 	for {
 		env, err := s.conn.ReceiveOneWithTimeout(500 * time.Millisecond)
@@ -194,7 +194,6 @@ func (s *GameServer) Run() error {
 			continue
 		}
 
-		// Обновляем LastSeen
 		senderID := env.Msg.GetSenderId()
 		if senderID != 0 {
 			s.mu.Lock()
@@ -212,14 +211,12 @@ func (s *GameServer) Stop() {
 	close(s.stopCh)
 }
 
-// pingerAndRetransmitLoop занимается и Alive Check, и Retransmission
 func (s *GameServer) pingerAndRetransmitLoop() {
 	delayMs := s.cfg.GetStateDelayMs()
 	if delayMs < 100 {
 		delayMs = 100
 	}
 
-	// Интервал ретрая и пинга = delay / 10
 	interval := time.Duration(delayMs/10) * time.Millisecond
 	timeoutDuration := time.Duration(float64(delayMs)*0.8) * time.Millisecond
 
@@ -237,7 +234,6 @@ func (s *GameServer) pingerAndRetransmitLoop() {
 	}
 }
 
-// checkRetransmits переотправляет потерянные сообщения
 func (s *GameServer) checkRetransmits(interval time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -245,12 +241,10 @@ func (s *GameServer) checkRetransmits(interval time.Duration) {
 	now := time.Now()
 	for _, pm := range s.sentMessages {
 		if now.Sub(pm.lastSent) > interval {
-			// Пора переотправлять
 			s.log.Printf("Retrying msg seq=%d type=%T to %s", pm.msg.GetMsgSeq(), pm.msg.Type, pm.to)
 			if err := s.conn.Send(pm.msg, pm.to); err == nil {
 				pm.lastSent = now
 
-				// Обновляем LastSent для пингера, чтобы не слать лишние пинги
 				if pm.msg.ReceiverId != nil {
 					recID := pm.msg.GetReceiverId()
 					s.playersLastSent[recID] = now
@@ -272,7 +266,7 @@ func (s *GameServer) checkAlive(pingInterval, timeoutDuration time.Duration) {
 			continue
 		}
 
-		// 1. Timeout
+		// Timeout
 		lastSeen, seenOk := s.playersLastSeen[id]
 		if !seenOk {
 			s.playersLastSeen[id] = now
@@ -284,26 +278,19 @@ func (s *GameServer) checkAlive(pingInterval, timeoutDuration time.Duration) {
 			continue
 		}
 
-		// 2. Ping
+		// Ping
 		lastSent, sentOk := s.playersLastSent[id]
 		if !sentOk {
 			s.playersLastSent[id] = now
 			lastSent = now
 		}
 
-		// Если мы молчим дольше интервала, надо слать Ping
-		// Но Ping теперь тоже Reliable, так что он попадет в sentMessages
-		// Чтобы не плодить пинги каждую итерацию, проверяем lastSent
 		if now.Sub(lastSent) > pingInterval {
 			pingMsg := domain.NewPingMessage(s.nextSeq(), s.nodeID, id)
 
-			// Используем rawSend + сохранение в sentMessages (но без лока, т.к. мы уже под локом)
-			// Приходится дублировать логику SendReliable, чтобы избежать deadlock
-
 			s.conn.Send(pingMsg, addr)
-			s.playersLastSent[id] = now // Обновили сразу
+			s.playersLastSent[id] = now
 
-			// Сохраняем для ретрая
 			s.sentMessages[pingMsg.GetMsgSeq()] = &pendingMessage{
 				msg:      pingMsg,
 				to:       addr,
@@ -338,7 +325,6 @@ func (s *GameServer) stateBroadcastLoop() {
 		}
 		s.mu.RUnlock()
 
-		// StateMsg отправляем каждому отдельно с новым seq, чтобы отслеживать Ack
 		for id, addr := range targets {
 			if addr == nil {
 				continue
@@ -346,7 +332,6 @@ func (s *GameServer) stateBroadcastLoop() {
 			msg := domain.NewStateMessage(s.nextSeq(), s.nodeID, st)
 			msg.ReceiverId = proto.Int32(id)
 
-			// StateMsg тоже требует Ack
 			s.SendReliable(msg, addr)
 		}
 	}
@@ -367,7 +352,6 @@ func (s *GameServer) announceLoop() {
 		case <-ticker.C:
 			msg := s.buildAnnouncementMsg()
 			msg.ReceiverId = nil
-			// Announcement не надежный
 			s.conn.Send(msg, group)
 		}
 	}
@@ -389,11 +373,8 @@ func (s *GameServer) buildAnnouncementMsg() *domain.GameMessage {
 	})
 }
 
-// sendAck отправляет AckMsg в ответ на msgSeq
 func (s *GameServer) sendAck(msgSeq int64, toID int32, toAddr *net.UDPAddr) {
-	// AckMsg должен иметь тот же msg_seq, что и подтверждаемое сообщение
 	ack := domain.NewAckMessage(msgSeq, s.nodeID, toID)
-	// Ack отправляем ненадежно (ack на ack не шлют)
 	s.rawSend(ack, toAddr)
 }
 
@@ -401,7 +382,7 @@ func (s *GameServer) handleMessage(msg *domain.GameMessage, from *net.UDPAddr) {
 	senderID := msg.GetSenderId()
 	seq := msg.GetMsgSeq()
 
-	// 1. Ack Handling
+	//  Ack Handling
 	if _, ok := msg.Type.(*domain.GameMessage_Ack); ok {
 		s.mu.Lock()
 		delete(s.sentMessages, seq)
@@ -409,15 +390,12 @@ func (s *GameServer) handleMessage(msg *domain.GameMessage, from *net.UDPAddr) {
 		return
 	}
 
-	// 2. Auto-Ack для надежных сообщений
 	if isReliableMessage(msg) {
-		// Join обрабатываем отдельно
 		if _, isJoin := msg.Type.(*domain.GameMessage_Join); !isJoin {
 			s.sendAck(seq, senderID, from)
 		}
 	}
 
-	// 3. Routing
 	switch t := msg.Type.(type) {
 	case *domain.GameMessage_Join:
 		s.handleJoin(msg, t.Join, from)
@@ -426,13 +404,11 @@ func (s *GameServer) handleMessage(msg *domain.GameMessage, from *net.UDPAddr) {
 	case *domain.GameMessage_Steer:
 		s.handleSteer(msg, t.Steer)
 	case *domain.GameMessage_Ping:
-		// LastSeen уже обновлен в Run(), ничего делать не надо
 	case *domain.GameMessage_RoleChange:
 		s.handleRoleChange(msg, t.RoleChange, from)
 	}
 }
 
-// РЕАЛИЗАЦИЯ ТОГО, ЧТО БЫЛО В КОММЕНТАРИЯХ (RoleChange)
 func (s *GameServer) handleRoleChange(
 	raw *domain.GameMessage,
 	rc *domain.GameMessage_RoleChangeMsg,
@@ -440,29 +416,11 @@ func (s *GameServer) handleRoleChange(
 ) {
 	senderID := raw.GetSenderId()
 
-	// Логика: Игрок хочет сменить роль (например, выйти в VIEWER)
-	// Протокол позволяет менять SenderRole (кем я стал) и ReceiverRole (кем ты стань).
-
-	// Вариант 1: Игрок уходит в зрители (выход из игры)
 	if rc.SenderRole != nil && *rc.SenderRole == domain.NodeRole_VIEWER {
 		s.log.Printf("Player %d requested to become VIEWER (leaving game)", senderID)
-
-		// 1. В движке делаем его змею зомби
 		s.engine.RemovePlayer(senderID)
-
-		// 2. Обновляем роль в списке игроков сервера
-		s.mu.Lock()
-		// Мы не удаляем его из players map, так как он все еще подключен как зритель
-		// Но нам нужно обновить его роль в GameState.
-		// GameState управляется Engine, поэтому Engine.RemovePlayer должен был выставить статус ZOMBIE змее.
-		// А роль игрока в списке Players тоже надо сменить.
-		s.mu.Unlock()
-
-		// Прямое обновление списка игроков через Engine (нужен метод UpdatePlayerRole, но для MVP RemovePlayer достаточно,
-		// так как зомби-змея отвязывается от управления).
 	}
 
-	// Вариант 2: Заместитель становится Мастером (DEPUTY -> MASTER)
 	if rc.SenderRole != nil && *rc.SenderRole == domain.NodeRole_MASTER {
 		s.log.Printf("WARNING: Player %d claims to be MASTER!", senderID)
 	}
@@ -479,12 +437,10 @@ func (s *GameServer) handleJoin(
 
 	s.mu.RLock()
 	for id, pAddr := range s.players {
-		// Сравниваем IP и Порт (или Имя, если считаем его уникальным)
 		if pAddr.String() == from.String() {
 			s.mu.RUnlock()
-			// Игрок уже есть, просто шлем Ack повторно
 			s.log.Printf("Duplicate Join from %s, resending Ack", from)
-			s.sendAck(raw.GetMsgSeq(), id, from) // Используем уже существующий ID
+			s.sendAck(raw.GetMsgSeq(), id, from)
 			return
 		}
 	}
@@ -503,7 +459,7 @@ func (s *GameServer) handleJoin(
 
 	if err := s.engine.AddPlayer(player); err != nil {
 		errMsg := domain.NewErrorMessage(s.nextSeq(), s.nodeID, newID, err.Error())
-		s.SendReliable(errMsg, from) // Error тоже reliable
+		s.SendReliable(errMsg, from)
 		return
 	}
 
@@ -513,10 +469,7 @@ func (s *GameServer) handleJoin(
 	s.playersLastSent[newID] = time.Now()
 	s.mu.Unlock()
 
-	// Шлем Ack (на Join это обязательно)
-	// ВАЖНО: Ack должен иметь seq как у Join
 	ack := domain.NewAckMessage(raw.GetMsgSeq(), s.nodeID, newID)
-	// Ack не сохраняем в sentMessages, но шлем через rawSend
 	s.rawSend(ack, from)
 
 	s.log.Printf("Player joined: %s (id=%d)", name, newID)

@@ -1,13 +1,11 @@
 package domain
 
-// Вспомогательные функции-указатели.
 func Int64Ptr(v int64) *int64                { return &v }
 func Int32Ptr(v int32) *int32                { return &v }
 func StringPtr(v string) *string             { return &v }
 func NodeRolePtr(r NodeRole) *NodeRole       { return &r }
 func PlayerTypePtr(t PlayerType) *PlayerType { return &t }
 
-// базовый конструктор GameMessage c общим прологом.
 func newBaseGameMessage(msgSeq int64, senderId, receiverId *int32) *GameMessage {
 	m := &GameMessage{
 		MsgSeq: Int64Ptr(msgSeq),
@@ -21,8 +19,6 @@ func newBaseGameMessage(msgSeq int64, senderId, receiverId *int32) *GameMessage 
 	return m
 }
 
-// ---------- PING ----------
-
 func NewPingMessage(msgSeq int64, senderId, receiverId int32) *GameMessage {
 	m := newBaseGameMessage(msgSeq, Int32Ptr(senderId), Int32Ptr(receiverId))
 	m.Type = &GameMessage_Ping{
@@ -30,8 +26,6 @@ func NewPingMessage(msgSeq int64, senderId, receiverId int32) *GameMessage {
 	}
 	return m
 }
-
-// ---------- STEER ----------
 
 func NewSteerMessage(msgSeq int64, senderId int32, direction Direction) *GameMessage {
 	m := newBaseGameMessage(msgSeq, Int32Ptr(senderId), nil)
@@ -43,8 +37,6 @@ func NewSteerMessage(msgSeq int64, senderId int32, direction Direction) *GameMes
 	return m
 }
 
-// ---------- ACK ----------
-
 func NewAckMessage(msgSeq int64, senderId, receiverId int32) *GameMessage {
 	m := newBaseGameMessage(msgSeq, Int32Ptr(senderId), Int32Ptr(receiverId))
 	m.Type = &GameMessage_Ack{
@@ -52,8 +44,6 @@ func NewAckMessage(msgSeq int64, senderId, receiverId int32) *GameMessage {
 	}
 	return m
 }
-
-// ---------- STATE ----------
 
 func NewStateMessage(msgSeq int64, senderId int32, state *GameState) *GameMessage {
 	m := newBaseGameMessage(msgSeq, Int32Ptr(senderId), nil)
@@ -64,8 +54,6 @@ func NewStateMessage(msgSeq int64, senderId int32, state *GameState) *GameMessag
 	}
 	return m
 }
-
-// ---------- ANNOUNCEMENT ----------
 
 func NewAnnouncementMessage(msgSeq int64, senderId int32, games []*GameAnnouncement) *GameMessage {
 	m := newBaseGameMessage(msgSeq, Int32Ptr(senderId), nil)
@@ -80,8 +68,6 @@ func NewAnnouncementMessage(msgSeq int64, senderId int32, games []*GameAnnouncem
 func NewSingleGameAnnouncementMessage(msgSeq int64, senderId int32, game *GameAnnouncement) *GameMessage {
 	return NewAnnouncementMessage(msgSeq, senderId, []*GameAnnouncement{game})
 }
-
-// ---------- JOIN ----------
 
 func NewJoinMessage(
 	msgSeq int64,
@@ -103,8 +89,6 @@ func NewJoinMessage(
 	return m
 }
 
-// ---------- ERROR ----------
-
 func NewErrorMessage(
 	msgSeq int64,
 	senderId, receiverId int32,
@@ -118,8 +102,6 @@ func NewErrorMessage(
 	}
 	return m
 }
-
-// ---------- ROLE CHANGE ----------
 
 func NewRoleChangeMessage(
 	msgSeq int64,
@@ -141,8 +123,6 @@ func NewRoleChangeMessage(
 	}
 	return m
 }
-
-// ---------- DISCOVER ----------
 
 func NewDiscoverMessage(msgSeq int64, senderId int32) *GameMessage {
 	m := newBaseGameMessage(msgSeq, Int32Ptr(senderId), nil)

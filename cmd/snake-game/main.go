@@ -7,14 +7,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"google.golang.org/protobuf/proto" // НЕ ЗАБУДЬТЕ ДОБАВИТЬ ЭТОТ ИМПОРТ
+	"google.golang.org/protobuf/proto"
 
 	"snake-game/internal/application"
 	"snake-game/internal/domain"
 	"snake-game/internal/infrastracture/ui"
 )
 
-// ... (функция newFileLogger остается без изменений) ...
 func newFileLogger(fileName string, prefix string) (*log.Logger, *os.File, error) {
 	if err := os.MkdirAll("logs", 0o755); err != nil {
 		return nil, nil, err
@@ -36,7 +35,6 @@ type startLocalGameRequest struct {
 }
 
 func main() {
-	// ... (логика создания логгеров остается без изменений) ...
 	serverLogger, serverFile, err := newFileLogger("server.log", "[SERVER] ")
 	if err != nil {
 		log.Fatalf("cannot create server logger: %v", err)
@@ -49,7 +47,6 @@ func main() {
 	}
 	defer clientFile.Close()
 
-	// ... (переменные для меню остаются без изменений) ...
 	var (
 		startReq      *startLocalGameRequest
 		exitRequested bool
@@ -114,9 +111,7 @@ func main() {
 	}
 }
 
-// MASTER: Запускает Engine + Server + Local UI (MasterController)
 func runAsMaster(req *startLocalGameRequest, serverLogger *log.Logger) {
-	// 1. Каналы
 	// engineOut - сюда пишет Engine
 	engineOut := make(chan *domain.GameState, 32)
 
@@ -126,21 +121,16 @@ func runAsMaster(req *startLocalGameRequest, serverLogger *log.Logger) {
 	// uiIn - отсюда читает MasterController для отрисовки хосту
 	uiIn := make(chan *domain.GameState, 32)
 
-	// 2. Разветвитель (Broadcaster):
 	// Читает из engineOut и пересылает копии в serverIn и uiIn
 	go func() {
 		defer close(serverIn)
 		defer close(uiIn)
 
 		for st := range engineOut {
-			// Клонируем стейт для каждого потребителя, чтобы избежать гонок данных,
-			// если один потребитель (Server) читает медленнее другого (UI).
-			// Proto.Clone возвращает интерфейс, кастим обратно.
 
 			stForServer := proto.Clone(st).(*domain.GameState)
 			stForUI := proto.Clone(st).(*domain.GameState)
 
-			// Non-blocking send (если буфер полон — дропаем кадр, это нормально для реалтайм игры)
 			select {
 			case serverIn <- stForServer:
 			default:
@@ -153,55 +143,45 @@ func runAsMaster(req *startLocalGameRequest, serverLogger *log.Logger) {
 		}
 	}()
 
-	// 3. Создаем Engine
 	engine := application.NewGameEngine(req.cfg, engineOut, serverLogger)
 
-	// 4. Создаем GameServer (передаем serverIn)
 	srv, err := application.NewGameServer(
 		req.cfg,
 		req.gameName,
 		req.playerName,
 		req.playerType,
 		serverLogger,
-		serverIn, // <--- Сервер читает отсюда
+		serverIn,
 		engine,
 	)
 	if err != nil {
 		serverLogger.Fatalf("cannot create GameServer: %v", err)
 	}
 
-	// 5. Создаем UI для Мастера (MasterController)
-	// Мастер всегда имеет ID = 1 (зашито в GameServer.NewGameServer)
 	masterCtrl := application.NewMasterController(
 		req.gameName,
-		1, // Master ID
+		1,
 		req.cfg,
 		engine,
-		uiIn, // <--- UI читает отсюда
+		uiIn,
 	)
 
-	// 6. ЗАПУСК
-	// Запускаем Engine в фоне
 	go engine.Run()
 
-	// Запускаем Server в фоне
 	go func() {
 		if err := srv.Run(); err != nil {
 			serverLogger.Printf("GameServer stopped: %v", err)
 		}
 	}()
 
-	// Запускаем UI в ГЛАВНОМ потоке (tview требует main thread)
 	if err := masterCtrl.Run(); err != nil {
 		serverLogger.Printf("Master UI stopped: %v", err)
 	}
 
-	// Когда UI закрылся (ESC/Q) — останавливаем всё
 	engine.Stop()
-	time.Sleep(200 * time.Millisecond) // Даем время на cleanup
+	time.Sleep(200 * time.Millisecond)
 }
 
-// CLIENT (без изменений, просто для полноты картины)
 func runAsClient(
 	req *struct {
 		ann        *domain.GameAnnouncement

@@ -42,7 +42,6 @@ type GameClient struct {
 	serverLastSeen time.Time
 	lastSent       time.Time
 
-	// Надежность клиента
 	sentMessages map[int64]*clientPendingMsg
 
 	stopCh chan struct{}
@@ -97,14 +96,11 @@ func isReliableMessageC(msg *domain.GameMessage) bool {
 	}
 }
 
-// SendReliable отправляет и сохраняет для ретрая
 func (c *GameClient) SendReliable(msg *domain.GameMessage) error {
-	// 1. Отправляем
 	if err := c.rawSend(msg); err != nil {
 		return err
 	}
 
-	// 2. Сохраняем
 	if isReliableMessageC(msg) {
 		c.mu.Lock()
 		c.sentMessages[msg.GetMsgSeq()] = &clientPendingMsg{
@@ -127,7 +123,7 @@ func (c *GameClient) rawSend(msg *domain.GameMessage) error {
 }
 
 func (c *GameClient) sendAck(msgSeq int64) {
-	ack := domain.NewAckMessage(msgSeq, c.nodeID, 0) // ReceiverID для сервера можно 0 или 1
+	ack := domain.NewAckMessage(msgSeq, c.nodeID, 0)
 	c.rawSend(ack)
 }
 
@@ -152,18 +148,13 @@ func (c *GameClient) JoinOnce() error {
 	gotAck := false
 	deadline := time.Now().Add(3 * time.Second)
 
-	// Простой цикл ожидания, ретраи тут будут работать через общий механизм,
-	// если запустить его, но JoinOnce обычно блокирующий до запуска RunGame.
-	// Для простоты здесь сделаем локальный ретрай, так как RunGame еще не запущен.
-
 	ticker := time.NewTicker(time.Millisecond * 100)
 	defer ticker.Stop()
 
 	for time.Now().Before(deadline) {
-		// Ручной ретрай для Join, пока нет основного цикла
 		c.mu.Lock()
 		if pm, ok := c.sentMessages[seq]; ok {
-			if time.Since(pm.lastSent) > 1000*time.Millisecond { // Join ретраим реже
+			if time.Since(pm.lastSent) > 1000*time.Millisecond {
 				c.conn.Send(pm.msg, c.serverAddr)
 				pm.lastSent = time.Now()
 			}
@@ -178,7 +169,6 @@ func (c *GameClient) JoinOnce() error {
 			continue
 		}
 
-		// Обработка Ack
 		msg := env.Msg
 		if _, isAck := msg.Type.(*domain.GameMessage_Ack); isAck {
 			if msg.GetMsgSeq() == seq { // Подтверждение нашего Join
@@ -188,7 +178,6 @@ func (c *GameClient) JoinOnce() error {
 				}
 				gotAck = true
 
-				// Удаляем из очереди
 				c.mu.Lock()
 				delete(c.sentMessages, seq)
 				c.mu.Unlock()
@@ -229,9 +218,7 @@ func (c *GameClient) JoinOnce() error {
 	return nil
 }
 
-// LeaveGame отправляет уведомление о выходе (смена роли на VIEWER)
 func (c *GameClient) LeaveGame() {
-	// Если мы просто зритель, можно выходить молча
 	if c.reqRole == domain.NodeRole_VIEWER {
 		return
 	}
@@ -240,13 +227,11 @@ func (c *GameClient) LeaveGame() {
 	msg := domain.NewRoleChangeMessage(
 		c.incrementNextSeq(),
 		c.myID,
-		0,       // Серверу
-		&viewer, // SenderRole: Я становлюсь зрителем
+		0, // Серверу
+		&viewer,
 		nil,
 	)
 
-	// Шлем "надежно", но не будем долго ждать в цикле, так как мы выходим
-	// Попытаемся отправить пару раз
 	c.log.Printf("Sending LeaveGame (RoleChange -> VIEWER)...")
 	c.conn.Send(msg, c.serverAddr)
 	time.Sleep(50 * time.Millisecond)
@@ -359,7 +344,7 @@ func (c *GameClient) pingerAndRetransmitLoop(app *tview.Application) {
 			return
 		case <-ticker.C:
 			c.mu.Lock()
-			// 1. Ретраи
+			// Ретраи
 			now := time.Now()
 			for _, pm := range c.sentMessages {
 				if now.Sub(pm.lastSent) > interval {
@@ -369,7 +354,7 @@ func (c *GameClient) pingerAndRetransmitLoop(app *tview.Application) {
 				}
 			}
 
-			// 2. Таймаут
+			// Таймаут
 			if now.Sub(c.serverLastSeen) > timeoutDuration {
 				c.mu.Unlock()
 				c.log.Printf("Server timed out!")
@@ -377,10 +362,9 @@ func (c *GameClient) pingerAndRetransmitLoop(app *tview.Application) {
 				return
 			}
 
-			// 3. Пинг (если молчим)
+			// Пинг
 			if now.Sub(c.lastSent) > interval {
-				// Пинг создаем, но шлем через rawSend+добавление в мапу вручную,
-				// чтобы избежать дедлока при вызове SendReliable внутри Lock
+
 				pingMsg := domain.NewPingMessage(c.incrementNextSeq(), c.myID, 0)
 				c.conn.Send(pingMsg, c.serverAddr)
 

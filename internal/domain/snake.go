@@ -5,15 +5,6 @@ import (
 	"fmt"
 )
 
-// SnakeCells декодирует представление "ключевых точек" змеи в полный
-// список занятых клеток (от головы к хвосту).
-//
-// Предполагается, что первая точка в Points — абсолютная координата головы,
-// а каждая последующая — смещение (deltaX, deltaY) от предыдущей "ключевой"
-// точки. При этом смещение может быть длиной > 1 клетки; мы раскрываем
-// этот отрезок в соответствующее число шагов вдоль оси.
-//
-// Алгоритм совместим и с представлением, когда каждое смещение — ровно один шаг.
 func SnakeCells(s *GameState_Snake, size BoardSize) []Cell {
 	if s == nil || len(s.GetPoints()) == 0 {
 		return nil
@@ -62,12 +53,6 @@ func SnakeCells(s *GameState_Snake, size BoardSize) []Cell {
 	return cells
 }
 
-// EncodeSnakeFromCells кодирует змею из списка клеток (от головы к хвосту)
-// обратно в protobuf-представление GameState_Snake.
-//
-// Мы используем "плотное" представление — каждый шаг сохраняется как
-// отдельная точка-смещение (deltaX, deltaY) длиной ровно в одну клетку.
-// Это полностью соответствует протоколу, но проще и однозначно.
 func EncodeSnakeFromCells(playerID int32, cells []Cell, headDir Direction, state GameState_Snake_SnakeState, size BoardSize) (*GameState_Snake, error) {
 	if len(cells) == 0 {
 		return nil, fmt.Errorf("EncodeSnakeFromCells: empty cells")
@@ -75,18 +60,15 @@ func EncodeSnakeFromCells(playerID int32, cells []Cell, headDir Direction, state
 
 	pts := make([]*GameState_Coord, 0, len(cells))
 
-	// Первая точка — абсолютные координаты головы
 	head := WrapCell(cells[0], size)
 	pts = append(pts, CellToCoord(head))
 
-	// Остальные — по одному шагу-смещению к следующей клетке
 	for i := 1; i < len(cells); i++ {
 		prev := WrapCell(cells[i-1], size)
 		cur := WrapCell(cells[i], size)
 
 		var dx, dy int32
 
-		// Определяем, куда мы шагнули, учитывая тор.
 		if cur.X == Wrap(prev.X+1, size.Width) && cur.Y == prev.Y {
 			dx, dy = 1, 0
 		} else if cur.X == Wrap(prev.X-1, size.Width) && cur.Y == prev.Y {
@@ -113,7 +95,6 @@ func EncodeSnakeFromCells(playerID int32, cells []Cell, headDir Direction, state
 	}, nil
 }
 
-// SnakeHeadCell возвращает клетку головы змейки.
 func SnakeHeadCell(s *GameState_Snake, size BoardSize) Cell {
 	if s == nil || len(s.GetPoints()) == 0 {
 		return Cell{}
@@ -121,7 +102,6 @@ func SnakeHeadCell(s *GameState_Snake, size BoardSize) Cell {
 	return WrapCell(CoordToCell(s.GetPoints()[0]), size)
 }
 
-// SnakeLength возвращает длину змейки в клетках.
 func SnakeLength(s *GameState_Snake, size BoardSize) int {
 	return len(SnakeCells(s, size))
 }

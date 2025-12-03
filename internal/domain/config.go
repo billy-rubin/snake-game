@@ -58,7 +58,6 @@ func ValidateConfig(cfg *GameConfig) error {
 	return nil
 }
 
-// Вспомогательные функции для указателей (protobuf-поля).
 func int32p(v int32) *int32 { return &v }
 func int64p(v int64) *int64 { return &v }
 func boolp(v bool) *bool    { return &v }

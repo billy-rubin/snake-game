@@ -10,17 +10,14 @@ import (
 	"snake-game/internal/infrastracture/network"
 )
 
-// универсальный интерфейс логгера
 type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// пустой логгер, если nil
 type nilLogger struct{}
 
 func (nilLogger) Printf(string, ...any) {}
 
-// Lobby занимается discovery игр через multicast.
 type Lobby struct {
 	log      Logger
 	onUpdate func([]*domain.GameAnnouncement)

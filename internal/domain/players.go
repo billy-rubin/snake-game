@@ -1,7 +1,5 @@
 package domain
 
-// NewPlayer создаёт объект GamePlayer с заданными полями.
-// IpAddress/Port заполняются позже сетевым слоем.
 func NewPlayer(id int32, name string, role NodeRole, ptype PlayerType) *GamePlayer {
 	return &GamePlayer{
 		Name:  stringp(name),
@@ -12,7 +10,6 @@ func NewPlayer(id int32, name string, role NodeRole, ptype PlayerType) *GamePlay
 	}
 }
 
-// GetPlayerByID ищет игрока по идентификатору в GamePlayers.
 func GetPlayerByID(players *GamePlayers, id int32) *GamePlayer {
 	if players == nil {
 		return nil
@@ -25,8 +22,6 @@ func GetPlayerByID(players *GamePlayers, id int32) *GamePlayer {
 	return nil
 }
 
-// NextPlayerID возвращает следующий свободный идентификатор игрока
-// (max(existing)+1). Если игроков нет, возвращает 1.
 func NextPlayerID(players *GamePlayers) int32 {
 	var maxID int32
 	if players != nil {
